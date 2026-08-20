@@ -1,0 +1,140 @@
+{
+  "rules": [
+    {
+      "id": "R-STOCK-001",
+      "category": "inventory",
+      "description": "Requested quantity must not exceed available stock",
+      "check": "qty_within_stock",
+      "on_fail": "BLOCK",
+      "reason_template": "Requested quantity ({requested_qty}) exceeds available stock ({available_stock}) for {sku}"
+    },
+    {
+      "id": "R-STOCK-002",
+      "category": "inventory",
+      "description": "Item must have nonzero stock to be added to cart",
+      "check": "stock_nonzero",
+      "on_fail": "BLOCK",
+      "reason_template": "{sku} is out of stock"
+    },
+    {
+      "id": "R-QUOTE-001",
+      "category": "quote_integrity",
+      "description": "Quote referenced at checkout must exist and not be expired",
+      "check": "quote_not_expired",
+      "on_fail": "BLOCK",
+      "reason_template": "Quote {quote_id} has expired (issued {issued_at}, TTL {ttl_seconds}s). Re-quote required."
+    },
+    {
+      "id": "R-QUOTE-002",
+      "category": "quote_integrity",
+      "description": "Quote's cart hash must match current cart contents exactly",
+      "check": "quote_matches_cart",
+      "on_fail": "BLOCK",
+      "reason_template": "Cart contents changed since quote {quote_id} was issued. Re-quote required."
+    },
+    {
+      "id": "R-QUOTE-003",
+      "category": "quote_integrity",
+      "description": "A quote can only be consumed once — prevents replay of the same quote across two checkout attempts (double-spend)",
+      "check": "quote_not_consumed",
+      "on_fail": "BLOCK",
+      "reason_template": "Quote {quote_id} has already been consumed by a prior checkout attempt. Re-quote required."
+    },
+    {
+      "id": "R-RESERVE-001",
+      "category": "reservation",
+      "description": "The stock reservation created at quote-issue time must still hold at checkout — protects against overselling when two sessions raced for the same limited stock",
+      "check": "reservation_still_held",
+      "on_fail": "BLOCK",
+      "reason_template": "Reservation for {sku} (qty {requested_qty}) is no longer held — it expired or was released. Re-quote required."
+    },
+    {
+      "id": "R-INPUT-001",
+      "category": "input_validation",
+      "description": "Requested quantity must be a positive integer",
+      "check": "qty_is_positive_integer",
+      "on_fail": "BLOCK",
+      "reason_template": "Requested quantity ({requested_qty}) for {sku} is not a valid positive integer"
+    },
+    {
+      "id": "R-PAYMENT-001",
+      "category": "payment_integrity",
+      "description": "The amount sent to the payment provider must exactly equal the quote total — never a value supplied by the agent",
+      "check": "payment_amount_matches_quote",
+      "on_fail": "BLOCK",
+      "reason_template": "Payment amount (₹{payment_amount}) does not match quote total (₹{quote_total}) for {quote_id}"
+    },
+    {
+      "id": "R-APPROVAL-001",
+      "category": "approval_integrity",
+      "description": "The approver identity must differ from the requesting agent/session — an agent session cannot approve its own high-risk transaction",
+      "check": "approver_not_requester",
+      "on_fail": "BLOCK",
+      "reason_template": "Approval for {quote_id} was attempted by the same session that requested the transaction"
+    },
+    {
+      "id": "R-APPROVAL-002",
+      "category": "approval_integrity",
+      "description": "An approval is only valid for the exact transaction snapshot (cart hash + total) it was granted against — if anything changed after approval, it's void",
+      "check": "approval_matches_snapshot",
+      "on_fail": "BLOCK",
+      "reason_template": "Transaction changed after approval was granted for {quote_id} — approval is no longer valid, must re-request"
+    },
+    {
+      "id": "R-SPEND-001",
+      "category": "spend_limit",
+      "description": "Single transaction over per-transaction cap requires approval",
+      "check": "transaction_total_under",
+      "threshold_inr": 5000,
+      "on_fail": "REQUIRE_APPROVAL",
+      "reason_template": "Transaction total ₹{total} exceeds auto-approve limit of ₹{threshold_inr}"
+    },
+    {
+      "id": "R-SPEND-002",
+      "category": "spend_limit",
+      "description": "Cumulative session spend over cap requires approval",
+      "check": "session_cumulative_under",
+      "threshold_inr": 15000,
+      "on_fail": "REQUIRE_APPROVAL",
+      "reason_template": "Session cumulative spend (₹{session_total}) would exceed ₹{threshold_inr}"
+    },
+    {
+      "id": "R-SKU-001",
+      "category": "sku_risk",
+      "description": "SKUs flagged high_value always require approval regardless of price threshold logic",
+      "check": "sku_has_flag",
+      "flag": "requires_approval_always",
+      "on_fail": "REQUIRE_APPROVAL",
+      "reason_template": "{sku} is flagged as always requiring approval"
+    },
+    {
+      "id": "R-SKU-002",
+      "category": "sku_risk",
+      "description": "SKUs flagged restricted cannot be purchased autonomously by an agent under any circumstances",
+      "check": "sku_has_flag",
+      "flag": "no_agent_autonomous_purchase",
+      "on_fail": "BLOCK",
+      "reason_template": "{sku} cannot be purchased by an agent without direct human initiation"
+    },
+    {
+      "id": "R-VELOCITY-001",
+      "category": "velocity",
+      "description": "More than 3 checkout attempts in 10 minutes from one session triggers approval",
+      "check": "checkout_attempts_under",
+      "max_attempts": 3,
+      "window_seconds": 600,
+      "on_fail": "REQUIRE_APPROVAL",
+      "reason_template": "Session exceeded {max_attempts} checkout attempts within {window_seconds}s"
+    },
+    {
+      "id": "R-SESSION-001",
+      "category": "session_trust",
+      "description": "Unverified/new agent sessions have a lower auto-approve ceiling",
+      "check": "verified_session_or_under",
+      "unverified_threshold_inr": 2000,
+      "on_fail": "REQUIRE_APPROVAL",
+      "reason_template": "Unverified session attempting purchase (₹{total}) above unverified limit of ₹{unverified_threshold_inr}"
+    }
+  ],
+  "resolution_order_note": "Engine evaluates ALL rules. If any rule returns BLOCK, final decision is BLOCK regardless of others. Else if any rule returns REQUIRE_APPROVAL, final decision is REQUIRE_APPROVAL. Else ALLOW. This 'strictest wins' logic must never be short-circuited for audit completeness — always run every rule and log every result, even after a BLOCK is found."
+}
