@@ -11,12 +11,14 @@ from db.models import Inventory, Product, Promotion
 from db.session import get_session, init_db
 from services.domain_vocab import BRANDS, COLORS, FEATURE_PHRASES
 
-RAW_CSV = Path(__file__).resolve().parent.parent / "data" / "raw" / "amazon_uk_products.csv"
+# NOTE: this must match the actual filename in data/raw/. The repo currently
+# ships data/raw/amz_uk_processed_data_recovered.csv -- update this if you
+# swap in a different export.
+RAW_CSV = Path(__file__).resolve().parent.parent / "data" / "raw" / "amz_uk_processed_data_recovered.csv"
 CHUNK_SIZE = 200_000
-SAMPLE_PER_CATEGORY = 50  # products kept per category -> ~1,350 products across 27 categories
 GBP_TO_INR = 105.0
 
-LOW_VELOCITY_QUANTILE = 0.25
+PROMOTION_RATE = 0.25  # fraction of catalog seeded with a clearance promo (see _deterministic_is_promoted)
 
 _COLOR_PATTERNS = sorted(COLORS, key=len, reverse=True)
 _BRAND_RE = re.compile(r"\b(" + "|".join(re.escape(b) for b in BRANDS) + r")\b", re.IGNORECASE)
@@ -54,12 +56,22 @@ def _deterministic_discount(asin: str) -> float:
     return round(10 + (h % 16), 1)  # 10.0 .. 25.0
 
 
+def _deterministic_is_promoted(asin: str) -> bool:
+    """~PROMOTION_RATE of SKUs get a seeded promotion, chosen deterministically
+    from the SKU itself -- NOT from boughtInLastMonth or any other purchase-
+    history figure. This is synthetic "the merchant is currently running a
+    clearance on these items" data, independent of anyone's buying behavior."""
+    h = int(hashlib.sha1((asin + "promo-eligible").encode()).hexdigest(), 16)
+    bucket = max(1, round(1 / PROMOTION_RATE))
+    return (h % bucket) == 0
+
+
 def load_filtered(csv_path: Path = RAW_CSV) -> pd.DataFrame:
     kept_frames: list[pd.DataFrame] = []
 
     for chunk in pd.read_csv(
         csv_path,
-        usecols=["asin", "title", "stars", "reviews", "price", "isBestSeller", "boughtInLastMonth", "categoryName"],
+        usecols=["asin", "title", "stars", "reviews", "price", "isBestSeller", "categoryName"],
         chunksize=CHUNK_SIZE,
     ):
         chunk = chunk[(chunk["price"] > 0) & (chunk["stars"] > 0)]
@@ -73,19 +85,18 @@ def load_filtered(csv_path: Path = RAW_CSV) -> pd.DataFrame:
     df = pd.concat(kept_frames, ignore_index=True)
     df = df.drop_duplicates(subset="asin")
 
-    sampled = [
-        g.sample(n=min(SAMPLE_PER_CATEGORY, len(g)), random_state=42)
-        for _, g in df.groupby("categoryName")
-    ]
-    df = pd.concat(sampled, ignore_index=True)
+    # No per-category sampling cap: ingest every row that survives the
+    # price/stars/dedup filters above.
 
     df["brand"] = df["title"].map(_extract_brand)
     df["color"] = df["title"].map(_extract_color)
     df["features"] = df["title"].map(_extract_features)
     df["price_inr"] = (df["price"] * GBP_TO_INR / 10).round() * 10
 
-    df["velocity_percentile"] = df.groupby("categoryName")["boughtInLastMonth"].rank(pct=True)
-    df["is_low_velocity"] = df["velocity_percentile"] <= LOW_VELOCITY_QUANTILE
+    # Which SKUs are "currently on promotion" is chosen from the SKU itself,
+    # not from boughtInLastMonth or any other purchase-count signal -- see
+    # _deterministic_is_promoted().
+    df["is_promoted"] = df["asin"].map(_deterministic_is_promoted)
 
     return df
 
@@ -110,7 +121,10 @@ def _derive_tags(row: pd.Series) -> str:
     return ",".join(tags)
 
 
-def ingest(csv_path: Path = RAW_CSV, drop_first: bool = True) -> dict:
+def ingest(csv_path: Path = RAW_CSV, drop_first: bool = True, batch_size: int = 5000) -> dict:
+    """Batches inserts (flush per batch to resolve Product.id -> children,
+    commit per batch) instead of flushing every single row -- at ~100K+ rows
+    a flush-per-row pattern is unusably slow."""
     init_db(drop_first=drop_first)
     df = load_filtered(csv_path)
     df["price_percentile"] = df.groupby("categoryName")["price_inr"].rank(pct=True)
@@ -120,12 +134,43 @@ def ingest(csv_path: Path = RAW_CSV, drop_first: bool = True) -> dict:
     n_products = n_promotions = 0
 
     try:
+        batch: list[tuple[Product, pd.Series]] = []
+
+        def flush_batch() -> None:
+            nonlocal n_products, n_promotions
+            if not batch:
+                return
+            session.add_all([p for p, _ in batch])
+            session.flush()  # assigns .id to every Product object in this batch
+
+            children = []
+            for product, row in batch:
+                children.append(Inventory(product_id=product.id, stock_quantity=_deterministic_stock(str(row["asin"]))))
+                if row["is_promoted"]:
+                    children.append(Promotion(
+                        product_id=product.id,
+                        discount_percent=_deterministic_discount(str(row["asin"])),
+                        reason="Merchant clearance promotion",
+                        valid_from=now,
+                        valid_until=now + timedelta(days=30),
+                        is_active=True,
+                    ))
+                    n_promotions += 1
+                n_products += 1
+            session.add_all(children)
+            session.commit()
+            batch.clear()
+
         for _, row in df.iterrows():
             title = str(row["title"])[:300]
             product = Product(
                 sku=str(row["asin"]),
                 source_row_id=str(row["asin"]),
-                name=str(row["categoryName"]),
+                # FIX: name/description were swapped in the original script --
+                # `name` was being set to the category ("Electronics") and the
+                # real product title only lived in `description`. name is now
+                # the (truncated) title, category stays the category.
+                name=title[:200],
                 category=str(row["categoryName"]),
                 description=title,
                 price=float(row["price_inr"]),
@@ -135,31 +180,17 @@ def ingest(csv_path: Path = RAW_CSV, drop_first: bool = True) -> dict:
                 manufacturing_date="N/A",
                 expiration_date="N/A",
                 tags=_derive_tags(row),
+                brand=str(row["brand"]),
                 variant=f"{row['color']}/Standard",
                 color=row["color"],
                 size="Standard",
                 rating=max(1, min(5, round(row["stars"]))),
             )
-            session.add(product)
-            session.flush()
+            batch.append((product, row))
+            if len(batch) >= batch_size:
+                flush_batch()
 
-            session.add(Inventory(product_id=product.id, stock_quantity=_deterministic_stock(str(row["asin"]))))
-            n_products += 1
-
-            if row["is_low_velocity"]:
-                session.add(
-                    Promotion(
-                        product_id=product.id,
-                        discount_percent=_deterministic_discount(str(row["asin"])),
-                        reason="Low sales velocity clearance",
-                        valid_from=now,
-                        valid_until=now + timedelta(days=30),
-                        is_active=True,
-                    )
-                )
-                n_promotions += 1
-
-        session.commit()
+        flush_batch()
     finally:
         session.close()
 
