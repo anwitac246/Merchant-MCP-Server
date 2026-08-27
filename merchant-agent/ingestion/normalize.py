@@ -1,11 +1,7 @@
-"""
-One-time ingestion pipeline: raw seed CSV -> merchant database (docx section
-3). After this runs, the database is the live source of truth; the CSV is
-never touched again.
-"""
 from __future__ import annotations
 
 import hashlib
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -13,41 +9,85 @@ import pandas as pd
 
 from db.models import Inventory, Product, Promotion
 from db.session import get_session, init_db
+from services.domain_vocab import BRANDS, COLORS, FEATURE_PHRASES
 
-RAW_CSV = Path(__file__).resolve().parent.parent / "data" / "raw" / "products.csv"
-SAMPLE_PER_GROUP = 40  # rows kept per (name, variant) group -> ~480 SKUs total
+RAW_CSV = Path(__file__).resolve().parent.parent / "data" / "raw" / "amazon_uk_products.csv"
+CHUNK_SIZE = 200_000
+SAMPLE_PER_CATEGORY = 50  # products kept per category -> ~1,350 products across 27 categories
+GBP_TO_INR = 105.0
 
-NAME_TO_CATEGORY = {
-    "Laptop": "Electronics",
-    "Smartphone": "Electronics",
-    "Monitor": "Electronics",
-    "Headphones": "Electronics",
-}
+LOW_VELOCITY_QUANTILE = 0.25
 
-# Realistic-ish INR retail bands per product line, order-of-magnitude only.
-PRICE_BANDS_INR = {
-    "Laptop": (25_000, 95_000),
-    "Smartphone": (8_000, 70_000),
-    "Monitor": (6_000, 35_000),
-    "Headphones": (1_200, 18_000),
-}
-
-OVERSTOCK_QUANTILE = 0.75  # top 25% stock within a name-group is "overstocked"
+_COLOR_PATTERNS = sorted(COLORS, key=len, reverse=True)
+_BRAND_RE = re.compile(r"\b(" + "|".join(re.escape(b) for b in BRANDS) + r")\b", re.IGNORECASE)
 
 
-def _deterministic_discount(sku: str) -> float:
-    """10-25%, stable per SKU rather than re-rolled every ingest run."""
-    h = int(hashlib.sha1(sku.encode()).hexdigest(), 16)
+def _extract_brand(title: str) -> str:
+    m = _BRAND_RE.search(title or "")
+    return m.group(1).title() if m else "Unbranded"
+
+
+def _extract_color(title: str) -> str:
+    t = (title or "").lower()
+    for color in _COLOR_PATTERNS:
+        if color in t:
+            return color.title()
+    return "Standard"
+
+
+def _extract_features(title: str) -> list[str]:
+    t = (title or "").lower()
+    found = []
+    for phrase, tag in FEATURE_PHRASES.items():
+        if phrase in t and tag not in found:
+            found.append(tag)
+    return found
+
+
+def _deterministic_stock(asin: str) -> int:
+    h = int(hashlib.sha1(asin.encode()).hexdigest(), 16)
+    return 3 + (h % 148)  # 3 .. 150
+
+
+def _deterministic_discount(asin: str) -> float:
+    h = int(hashlib.sha1((asin + "promo").encode()).hexdigest(), 16)
     return round(10 + (h % 16), 1)  # 10.0 .. 25.0
 
 
-def _describe(row: pd.Series) -> str:
-    return (
-        f"{row['Product Name']} ({row['color']}/{row['size']}). "
-        f"{row['Warranty Period']}-year warranty. "
-        f"Dimensions: {row['Product Dimensions']}. "
-        f"Rated {row['Product Ratings']}/5 by previous buyers."
-    )
+def load_filtered(csv_path: Path = RAW_CSV) -> pd.DataFrame:
+    kept_frames: list[pd.DataFrame] = []
+
+    for chunk in pd.read_csv(
+        csv_path,
+        usecols=["asin", "title", "stars", "reviews", "price", "isBestSeller", "boughtInLastMonth", "categoryName"],
+        chunksize=CHUNK_SIZE,
+    ):
+        chunk = chunk[(chunk["price"] > 0) & (chunk["stars"] > 0)]
+        chunk = chunk.dropna(subset=["categoryName", "title"])
+        if len(chunk):
+            kept_frames.append(chunk)
+
+    if not kept_frames:
+        raise ValueError("No rows survived the defensive filter -- check the CSV's price/stars columns.")
+
+    df = pd.concat(kept_frames, ignore_index=True)
+    df = df.drop_duplicates(subset="asin")
+
+    sampled = [
+        g.sample(n=min(SAMPLE_PER_CATEGORY, len(g)), random_state=42)
+        for _, g in df.groupby("categoryName")
+    ]
+    df = pd.concat(sampled, ignore_index=True)
+
+    df["brand"] = df["title"].map(_extract_brand)
+    df["color"] = df["title"].map(_extract_color)
+    df["features"] = df["title"].map(_extract_features)
+    df["price_inr"] = (df["price"] * GBP_TO_INR / 10).round() * 10
+
+    df["velocity_percentile"] = df.groupby("categoryName")["boughtInLastMonth"].rank(pct=True)
+    df["is_low_velocity"] = df["velocity_percentile"] <= LOW_VELOCITY_QUANTILE
+
+    return df
 
 
 def _derive_tags(row: pd.Series) -> str:
@@ -57,99 +97,61 @@ def _derive_tags(row: pd.Series) -> str:
         else "premium"
     )
     tags = [
-        row["Product Name"].lower(),
+        row["categoryName"].lower().replace(" ", "-").replace(",", ""),
+        row["brand"].lower(),
         row["color"].lower(),
-        row["size"].lower(),
         price_tier,
-        f"{row['Warranty Period']}yr-warranty",
+        *row["features"],
     ]
-    if row["Product Ratings"] >= 4:
+    if row["isBestSeller"]:
+        tags.append("bestseller")
+    if row["stars"] >= 4.3:
         tags.append("top-rated")
     return ",".join(tags)
 
 
-def load_and_normalize(csv_path: Path = RAW_CSV) -> pd.DataFrame:
-    df = pd.read_csv(csv_path)
-
-    df["category"] = df["Product Name"].map(NAME_TO_CATEGORY)
-    df[["color", "size"]] = df["Color/Size Variations"].str.split("/", expand=True)
-
-    # rescale price per product line: keep each row's percentile position
-    # within its own line's *full* raw distribution (computed pre-sample,
-    # so the scale doesn't shift if SAMPLE_PER_GROUP changes), remap into
-    # that line's realistic INR band.
-    df["price_percentile"] = df.groupby("Product Name")["Price"].rank(pct=True)
-
-    def _rescale(row: pd.Series) -> float:
-        lo, hi = PRICE_BANDS_INR[row["Product Name"]]
-        price = lo + row["price_percentile"] * (hi - lo)
-        return round(price / 10) * 10  # round to nearest 10
-
-    df["price_inr"] = df.apply(_rescale, axis=1)
-    df["description"] = df.apply(_describe, axis=1)
-    df["derived_tags"] = df.apply(_derive_tags, axis=1)
-
-    # stratified sample: keep distribution, cut volume
-    sampled_groups = [
-        g.sample(n=min(SAMPLE_PER_GROUP, len(g)), random_state=42)
-        for _, g in df.groupby(["Product Name", "Color/Size Variations"])
-    ]
-    df = pd.concat(sampled_groups, ignore_index=True)
-
-    # overstock flag computed within each name-group, on the sampled set
-    df["stock_quantile"] = df.groupby("Product Name")["Stock Quantity"].transform(
-        lambda s: s.rank(pct=True)
-    )
-    df["is_overstocked"] = df["stock_quantile"] >= OVERSTOCK_QUANTILE
-
-    return df
-
-
 def ingest(csv_path: Path = RAW_CSV, drop_first: bool = True) -> dict:
     init_db(drop_first=drop_first)
-    df = load_and_normalize(csv_path)
-    session = get_session()
+    df = load_filtered(csv_path)
+    df["price_percentile"] = df.groupby("categoryName")["price_inr"].rank(pct=True)
 
+    session = get_session()
     now = datetime.now(timezone.utc)
     n_products = n_promotions = 0
 
     try:
         for _, row in df.iterrows():
+            title = str(row["title"])[:300]
             product = Product(
-                sku=row["SKU"],
-                source_row_id=row["Product ID"],
-                name=row["Product Name"],
-                category=row["category"],
-                description=row["description"],
+                sku=str(row["asin"]),
+                source_row_id=str(row["asin"]),
+                name=str(row["categoryName"]),
+                category=str(row["categoryName"]),
+                description=title,
                 price=float(row["price_inr"]),
                 currency="INR",
-                warranty_period_years=int(row["Warranty Period"]),
-                dimensions_cm=row["Product Dimensions"],
-                manufacturing_date=row["Manufacturing Date"],
-                expiration_date=row["Expiration Date"],
-                tags=row["derived_tags"],
-                variant=row["Color/Size Variations"],
+                warranty_period_years=1,
+                dimensions_cm="N/A",
+                manufacturing_date="N/A",
+                expiration_date="N/A",
+                tags=_derive_tags(row),
+                variant=f"{row['color']}/Standard",
                 color=row["color"],
-                size=row["size"],
-                rating=int(row["Product Ratings"]),
+                size="Standard",
+                rating=max(1, min(5, round(row["stars"]))),
             )
             session.add(product)
-            session.flush()  # assign product.id
+            session.flush()
 
-            session.add(
-                Inventory(
-                    product_id=product.id,
-                    stock_quantity=int(row["Stock Quantity"]),
-                )
-            )
+            session.add(Inventory(product_id=product.id, stock_quantity=_deterministic_stock(str(row["asin"]))))
             n_products += 1
 
-            if row["is_overstocked"]:
+            if row["is_low_velocity"]:
                 session.add(
                     Promotion(
                         product_id=product.id,
-                        discount_percent=_deterministic_discount(row["SKU"]),
-                        reason="Overstock clearance",
+                        discount_percent=_deterministic_discount(str(row["asin"])),
+                        reason="Low sales velocity clearance",
                         valid_from=now,
                         valid_until=now + timedelta(days=30),
                         is_active=True,
@@ -164,10 +166,9 @@ def ingest(csv_path: Path = RAW_CSV, drop_first: bool = True) -> dict:
     return {
         "products_ingested": n_products,
         "promotions_created": n_promotions,
-        "source_rows": len(pd.read_csv(csv_path)),
+        "categories": sorted(df["categoryName"].unique().tolist()),
     }
 
 
 if __name__ == "__main__":
-    stats = ingest()
-    print(stats)
+    print(ingest())
